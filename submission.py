@@ -5,6 +5,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass import Float32
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import nvvm, llvm
 
 # Kernel configuration parameters
 mma_tiler_mnk = (128, 1, 64)  # Tile sizes for M, N, K dimensions
@@ -13,6 +16,10 @@ sf_dtype = cutlass.Float8E4M3FN  # FP8 data type for scale factors
 c_dtype = cutlass.Float16  # FP16 output type
 sf_vec_size = 16  # Scale factor block size (16 elements share one scale)
 threads_per_cta = 128  # Number of threads per CUDA thread block
+threads_per_m = 32  # Number of threads per CUDA thread block
+threads_per_k  = 32
+mma_tiler_mnk = (threads_per_m, 1, 256)  # Tile sizes for M, N, K dimensions
+accum_dtype = cutlass.Float32  # Float32 accumulation buffer
 
 
 # Helper function for ceiling division
@@ -20,7 +27,6 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
-# The CuTe reference implementation for NVFP4 block-scaled GEMV
 @cute.kernel
 def kernel(
     mA_mkl: cute.Tensor,
@@ -31,7 +37,7 @@ def kernel(
 ):
     # Get CUDA block and thread indices
     bidx, bidy, bidz = cute.arch.block_idx()
-    tidx, _, _ = cute.arch.thread_idx()
+    tidx, tidy, _ = cute.arch.thread_idx()
 
     # Extract the local tile for input matrix A (shape: [block_M, block_K, rest_M, rest_K, rest_L])
     gA_mkl = cute.local_tile(
@@ -58,20 +64,27 @@ def kernel(
     # Select output element corresponding to this thread and block indices
     tCgC = gC_mnl[tidx, None, bidx, bidy, bidz]
     tCgC = cute.make_tensor(tCgC.iterator, 1)
-    res = cute.zeros_like(tCgC, cutlass.Float32)
+    res = cute.zeros_like(tCgC, accum_dtype)
+
+    # Shared Memory
+    allocator = cutlass.utils.SmemAllocator()
+    smem_layout = cute.make_layout((threads_per_m, threads_per_k), stride = (threads_per_k, 1))
+    shared_res = allocator.allocate_tensor(element_type=cutlass.Float32, layout=smem_layout)
 
     # Get the number of k tiles (depth dimension) for the reduction loop
     k_tile_cnt = gA_mkl.layout[3].shape
-    for k_tile in range(k_tile_cnt):
+    for k_tile in range(tidy, k_tile_cnt, threads_per_k, unroll_full=True):
         tAgA = gA_mkl[tidx, None, bidx, k_tile, bidz]
         tBgB = gB_nkl[0, None, bidy, k_tile, bidz]
         tAgSFA = gSFA_mkl[tidx, None, bidx, k_tile, bidz]
         tBgSFB = gSFB_nkl[0, None, bidy, k_tile, bidz]
 
-        tArA = cute.make_rmem_tensor_like(tAgA, cutlass.Float32)
-        tBrB = cute.make_rmem_tensor_like(tBgB, cutlass.Float32)
-        tArSFA = cute.make_rmem_tensor_like(tAgSFA, cutlass.Float32)
-        tBrSFB = cute.make_rmem_tensor_like(tBgSFB, cutlass.Float32)
+        tArA = cute.make_rmem_tensor_like(tAgA, c_dtype)
+        tBrB = cute.make_rmem_tensor_like(tBgB, c_dtype)
+        tABrAB = cute.make_rmem_tensor_like(tAgA, c_dtype)
+        tArSFA = cute.make_rmem_tensor_like(tAgSFA, accum_dtype)
+        tBrSFB = cute.make_rmem_tensor_like(tBgSFB, accum_dtype)
+        tSFrSF = cute.make_rmem_tensor_like(tAgSFA, accum_dtype)
 
         # Load NVFP4 or FP8 values from global memory
         a_val_nvfp4 = tAgA.load()
@@ -80,10 +93,10 @@ def kernel(
         sfb_val_fp8 = tBgSFB.load()
 
         # Convert loaded values to float32 for computation (FFMA)
-        a_val = a_val_nvfp4.to(cutlass.Float32)
-        b_val = b_val_nvfp4.to(cutlass.Float32)
-        sfa_val = sfa_val_fp8.to(cutlass.Float32)
-        sfb_val = sfb_val_fp8.to(cutlass.Float32)
+        a_val = a_val_nvfp4.to(c_dtype)
+        b_val = b_val_nvfp4.to(c_dtype)
+        sfa_val = sfa_val_fp8.to(sf_dtype)
+        sfb_val = sfb_val_fp8.to(sf_dtype)
 
         # Store the converted values to RMEM CuTe tensors
         tArA.store(a_val)
@@ -91,12 +104,23 @@ def kernel(
         tArSFA.store(sfa_val)
         tBrSFB.store(sfb_val)
 
+        tABrAB.store(tArA.load() * tBrB.load())
+        tSFrSF.store(tArSFA.load() * tBrSFB.load())
+
         # Iterate over SF vector tiles and compute the scale&matmul accumulation
         for i in cutlass.range_constexpr(mma_tiler_mnk[2]):
-            res += tArA[i] * tArSFA[i] * tBrB[i] * tBrSFB[i]
+            res += tABrAB[i] * tSFrSF[i]
+   
+    shared_res[(tidx, tidy)] = res[0]
+    cute.arch.sync_threads()
+    
+    if tidy == 0:
+        out = cute.zeros_like(tCgC, accum_dtype)
+        for i in cutlass.range_constexpr(threads_per_k):
+            out += shared_res[(tidx, i)]
 
-    # Store the final float16 result back to global memory
-    tCgC.store(res.to(cutlass.Float16))
+        # Store the final float16 result back to global memory
+        tCgC.store(out.to(cutlass.Float16))
     return
 
 
@@ -148,7 +172,7 @@ def my_kernel(
     # - M_blocks = ceil(M / 128) to cover all output rows
     # - L = batch size
     grid = (
-        cute.ceil_div(c_tensor.shape[0], 128),
+        cute.ceil_div(c_tensor.shape[0], threads_per_m),
         1,
         c_tensor.shape[2],
     )
@@ -156,7 +180,7 @@ def my_kernel(
     # Launch the CUDA kernel
     kernel(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor).launch(
         grid=grid,
-        block=[threads_per_cta, 1, 1],
+        block=[threads_per_m, threads_per_k, 1],
         cluster=(1, 1, 1),
     )
     return
