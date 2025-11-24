@@ -3,11 +3,13 @@ from task import input_t, output_t
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute import TensorSSA
 from cutlass.cute.runtime import make_ptr
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass import Float32
+from cutlass import Float32, Float16, Float8E4M3FN, Int8, Int16, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import nvvm, llvm
+from cutlass._mlir.dialects import nvvm, llvm, arith, vector, builtin
+from cutlass._mlir import ir
 
 # Kernel configuration parameters
 ab_dtype = cutlass.Float4E2M1FN  # FP4 data type for A and B
@@ -24,6 +26,198 @@ accum_dtype = cutlass.Float32  # Float32 accumulation buffer
 def ceil_div(a, b):
     return (a + b - 1) // b
 
+
+# ============================================================================
+# FP8 (E4M3) to FP16 conversion intrinsics
+# These provide optimized conversion using PTX cvt.rn.f16x2.e4m3x2 instructions
+# ============================================================================
+
+@dsl_user_op
+def cvt_f8e4m3x2_to_f16x2(src_vec2, *, loc=None, ip=None):
+    """Convert 2 float8e4m3 values to 2 float16 values"""
+    # pack 2 float8e4m3 into 1 int16 value
+    src_i16 = llvm.bitcast(Int16.mlir_type, src_vec2, loc=loc, ip=ip)
+    rst_i32 = llvm.inline_asm(
+        Int32.mlir_type,
+        [src_i16],
+        """{\n\t
+            cvt.rn.f16x2.e4m3x2 $0, $1;\n\t
+        }""",
+        "=r,h",
+    )
+    vec_f16x2_type = ir.VectorType.get([2], Float16.mlir_type, loc=loc)
+    vec_f16x2 = llvm.bitcast(vec_f16x2_type, rst_i32, loc=loc, ip=ip)
+    return vec_f16x2
+
+
+@dsl_user_op
+def cvt_f8e4m3_f16(src, *, loc=None, ip=None):
+    """Convert single float8e4m3 value to float16"""
+    # 0 padding for upper 8 bits
+    zero = arith.constant(src.type, 0, loc=loc, ip=ip)
+    vec2 = vector.from_elements(
+        ir.VectorType.get([2], src.type, loc=loc), [src, zero], loc=loc, ip=ip
+    )
+    rst_vec2 = cvt_f8e4m3x2_to_f16x2(vec2, loc=loc, ip=ip)
+    # only the 1st element is valid
+    rst = vector.extract(
+        rst_vec2, dynamic_position=[], static_position=[0], loc=loc, ip=ip
+    )
+    return rst
+
+
+@dsl_user_op
+def cvt_f8e4m3x4_to_f16x4(src_vec4, *, loc=None, ip=None):
+    """Convert 4 float8e4m3 values to 4 float16 values"""
+    # pack 4 float8e4m3 into 1 int32 value
+    src_i32 = llvm.bitcast(Int32.mlir_type, src_vec4, loc=loc, ip=ip)
+    rst_i32x2 = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [src_i32],
+        """{\n\t
+            .reg .b16 h0, h1;\n\t
+            mov.b32 {h0, h1}, $2;\n\t
+            cvt.rn.f16x2.e4m3x2 $0, h0;\n\t
+            cvt.rn.f16x2.e4m3x2 $1, h1;\n\t
+        }""",
+        "=r,=r,r",
+    )
+    res0 = llvm.extractvalue(T.i32(), rst_i32x2, [0])
+    res1 = llvm.extractvalue(T.i32(), rst_i32x2, [1])
+    vec_i32x2_type = ir.VectorType.get([2], Int32.mlir_type, loc=loc)
+    vec_i32x2 = vector.from_elements(vec_i32x2_type, [res0, res1], loc=loc, ip=ip)
+    vec_f16x4_type = ir.VectorType.get([4], Float16.mlir_type, loc=loc)
+    vec_f16x4 = llvm.bitcast(vec_f16x4_type, vec_i32x2, loc=loc, ip=ip)
+    return vec_f16x4
+
+
+@dsl_user_op
+def cvt_f8e4m3x8_to_f16x8(src_vec8, *, loc=None, ip=None):
+    """Convert 8 float8e4m3 values to 8 float16 values"""
+    # Split into two i32 values instead of using i64
+    vec_i32x2_type = ir.VectorType.get([2], Int32.mlir_type, loc=loc)
+    src_i32x2 = llvm.bitcast(vec_i32x2_type, src_vec8, loc=loc, ip=ip)
+    src_lo = llvm.extractelement(src_i32x2, arith.constant(Int32.mlir_type, 0), loc=loc, ip=ip)
+    src_hi = llvm.extractelement(src_i32x2, arith.constant(Int32.mlir_type, 1), loc=loc, ip=ip)
+    
+    # Process lower 4 bytes (4 fp8 values)
+    rst_lo_i32x2 = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [src_lo],
+        """{\n\t
+            .reg .b16 h0, h1;\n\t
+            mov.b32 {h0, h1}, $2;\n\t
+            cvt.rn.f16x2.e4m3x2 $0, h0;\n\t
+            cvt.rn.f16x2.e4m3x2 $1, h1;\n\t
+        }""",
+        "=r,=r,r",
+    )
+    
+    # Process upper 4 bytes (4 fp8 values)
+    rst_hi_i32x2 = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [src_hi],
+        """{\n\t
+            .reg .b16 h0, h1;\n\t
+            mov.b32 {h0, h1}, $2;\n\t
+            cvt.rn.f16x2.e4m3x2 $0, h0;\n\t
+            cvt.rn.f16x2.e4m3x2 $1, h1;\n\t
+        }""",
+        "=r,=r,r",
+    )
+    
+    res0 = llvm.extractvalue(T.i32(), rst_lo_i32x2, [0])
+    res1 = llvm.extractvalue(T.i32(), rst_lo_i32x2, [1])
+    res2 = llvm.extractvalue(T.i32(), rst_hi_i32x2, [0])
+    res3 = llvm.extractvalue(T.i32(), rst_hi_i32x2, [1])
+    
+    vec_i32x4_type = ir.VectorType.get([4], Int32.mlir_type, loc=loc)
+    vec_i32x4 = vector.from_elements(
+        vec_i32x4_type, [res0, res1, res2, res3], loc=loc, ip=ip
+    )
+    vec_f16x8_type = ir.VectorType.get([8], Float16.mlir_type, loc=loc)
+    vec_f16x8 = llvm.bitcast(vec_f16x8_type, vec_i32x4, loc=loc, ip=ip)
+    return vec_f16x8
+
+
+@dsl_user_op
+def cvt_f8e4m3_f16_intrinsic(vec_f8e4m3, length, *, loc=None, ip=None):
+    """
+    Convert a vector of float8e4m3 to a vector of float16.
+    
+    :param vec_f8e4m3: The input vector of float8e4m3.
+    :param length: The length of the input vector.
+    :return: The output 1D vector of float16 with the same length as the input vector.
+    """
+    src_pos = 0
+    vec_src_i8 = builtin.unrealized_conversion_cast(
+        [ir.VectorType.get([length], Int8.mlir_type, loc=loc)],
+        [vec_f8e4m3],
+        loc=loc,
+        ip=ip,
+    )
+    vec_i8x8_type = ir.VectorType.get([8], Int8.mlir_type, loc=loc)
+    vec_i8x4_type = ir.VectorType.get([4], Int8.mlir_type, loc=loc)
+    vec_i8x2_type = ir.VectorType.get([2], Int8.mlir_type, loc=loc)
+    vec_dst_type = ir.VectorType.get([length], Float16.mlir_type, loc=loc)
+    vec_dst = llvm.mlir_zero(vec_dst_type, loc=loc, ip=ip)
+
+    # try to use vectorized version
+    if length >= 8:
+        num_vec8 = length // 8
+        for _ in range(num_vec8):
+            vec_f8e4m3x8 = vector.extract_strided_slice(
+                vec_i8x8_type, vec_src_i8, [src_pos], [8], [1], loc=loc, ip=ip
+            )
+            vec_f16x8 = cvt_f8e4m3x8_to_f16x8(vec_f8e4m3x8, loc=loc, ip=ip)
+            vec_dst = vector.insert_strided_slice(
+                vec_f16x8, vec_dst, [src_pos], [1], loc=loc, ip=ip
+            )
+            src_pos += 8
+            length -= 8
+
+    if length >= 4:
+        vec_f8e4m3x4 = vector.extract_strided_slice(
+            vec_i8x4_type, vec_src_i8, [src_pos], [4], [1], loc=loc, ip=ip
+        )
+        vec_f16x4 = cvt_f8e4m3x4_to_f16x4(vec_f8e4m3x4, loc=loc, ip=ip)
+        vec_dst = vector.insert_strided_slice(
+            vec_f16x4, vec_dst, [src_pos], [1], loc=loc, ip=ip
+        )
+        src_pos += 4
+        length -= 4
+
+    if length >= 2:
+        vec_f8e4m3x2 = vector.extract_strided_slice(
+            vec_i8x2_type, vec_src_i8, [src_pos], [2], [1], loc=loc, ip=ip
+        )
+        vec_f16x2 = cvt_f8e4m3x2_to_f16x2(vec_f8e4m3x2, loc=loc, ip=ip)
+        vec_dst = vector.insert_strided_slice(
+            vec_f16x2, vec_dst, [src_pos], [1], loc=loc, ip=ip
+        )
+        src_pos += 2
+        length -= 2
+
+    if length >= 1:
+        val_f16 = cvt_f8e4m3_f16(
+            vector.extractelement(
+                vec_src_i8,
+                position=arith.constant(Int32.mlir_type, src_pos),
+                loc=loc,
+                ip=ip,
+            ),
+            loc=loc,
+            ip=ip,
+        )
+        vec_dst = vector.insertelement(
+            val_f16,
+            vec_dst,
+            position=arith.constant(Int32.mlir_type, src_pos),
+            loc=loc,
+            ip=ip,
+        )
+
+    return vec_dst
 
 @cute.kernel
 def kernel(
@@ -90,11 +284,11 @@ def kernel(
         sfa_val_fp8 = tAgSFA.load()
         sfb_val_fp8 = tBgSFB.load()
 
-        # Convert loaded values to float32 for computation (FFMA)
+        # Convert FP4 -> FP16 and FP8 -> F32
         a_val = a_val_nvfp4.to(c_dtype)
         b_val = b_val_nvfp4.to(c_dtype)
-        sfa_val = sfa_val_fp8.to(sf_dtype)
-        sfb_val = sfb_val_fp8.to(sf_dtype)
+        sfa_val = sfa_val_fp8.to(accum_dtype)
+        sfb_val = sfb_val_fp8.to(accum_dtype)
 
         # Store the converted values to RMEM CuTe tensors
         tArA.store(a_val)
