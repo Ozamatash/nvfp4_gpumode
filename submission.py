@@ -256,12 +256,13 @@ def kernel(
     # Select output element corresponding to this thread and block indices
     tCgC = gC_mnl[tidx, None, bidx, bidy, bidz]
     tCgC = cute.make_tensor(tCgC.iterator, 1)
-    res = cute.zeros_like(tCgC, accum_dtype)
+    res = cute.make_rmem_tensor_like(cute.make_layout(2), c_dtype)
+    res.fill(0)
 
     # Shared Memory
     allocator = cutlass.utils.SmemAllocator()
     smem_layout = cute.make_layout((threads_per_m, threads_per_k), stride = (threads_per_k, 1))
-    shared_res = allocator.allocate_tensor(element_type=cutlass.Float32, layout=smem_layout)
+    shared_res = allocator.allocate_tensor(element_type=c_dtype, layout=smem_layout)
 
     # Get the number of k tiles (depth dimension) for the reduction loop
     k_tile_cnt = gA_mkl.layout[3].shape
@@ -284,11 +285,15 @@ def kernel(
         sfa_val_fp8 = tAgSFA.load()
         sfb_val_fp8 = tBgSFB.load()
 
-        # Convert FP4 -> FP16 and FP8 -> F32
+        # Convert FP4 -> FP16 and FP8 -> FP16
+        sfa_length = cute.size(tAgSFA.layout)
+        sfb_length = cute.size(tBgSFB.layout)
         a_val = a_val_nvfp4.to(c_dtype)
         b_val = b_val_nvfp4.to(c_dtype)
-        sfa_val = sfa_val_fp8.to(accum_dtype)
-        sfb_val = sfb_val_fp8.to(accum_dtype)
+        sfa_val_Vec = cvt_f8e4m3_f16_intrinsic(sfa_val_fp8, sfa_length)
+        sfa_val = cute.TensorSSA(sfa_val_Vec, tAgSFA.layout.shape, c_dtype)
+        sfb_val_Vec = cvt_f8e4m3_f16_intrinsic(sfb_val_fp8, sfb_length)
+        sfb_val = cute.TensorSSA(sfb_val_Vec, tBgSFB.layout.shape, c_dtype)
 
         # Store the converted values to RMEM CuTe tensors
         tArA.store(a_val)
