@@ -32,8 +32,8 @@ sf_vec_size = 16
 threads_per_cta = 128  
 # Stage numbers of shared memory and tmem
 num_acc_stage = 1
-num_ab_stage = 1
-num_c_stage = 2  # Number of stages for C epilogue buffer
+num_ab_stage = 2  # Overlap TMA loads with MMA computation
+num_c_stage = 2   # Overlap R2S writes with TMA S2G stores
 # Total number of columns in tmem
 num_tmem_alloc_cols = 512
 
@@ -656,32 +656,43 @@ def kernel(
     # Retile register tensor for R2S
     tRS_rC = tiled_copy_r2s.retile(tTR_rC)
     
-    # Setup TMA partition for SMEM to Global
-    sC_for_tma = cute.group_modes(sC[(None, None, 0)], 0, 2)
+    # Setup TMA partition for SMEM to Global - need separate partition per stage
     gC_for_tma = cute.group_modes(gC_epi, 0, 2)
-    bSG_sC, bSG_gC = cpasync.tma_partition(
+    
+    # Create TMA partitions for each stage
+    sC_stage0 = cute.group_modes(sC[(None, None, 0)], 0, 2)
+    sC_stage1 = cute.group_modes(sC[(None, None, 1)], 0, 2)
+    bSG_sC_0, bSG_gC = cpasync.tma_partition(
         tma_atom_c,
         0,  # CTA coordinate
         cute.make_layout(1),  # Single CTA
-        sC_for_tma,
+        sC_stage0,
+        gC_for_tma,
+    )
+    bSG_sC_1, _ = cpasync.tma_partition(
+        tma_atom_c,
+        0,
+        cute.make_layout(1),
+        sC_stage1,
         gC_for_tma,
     )
     
-    # Slice to current tile (no stage dimension in our case)
-    # tTR_tAcc has shape (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
-    # No need to slice stage since we don't have one
+    # Slice to current tile
     bSG_gC = bSG_gC[(None, None, None, *mma_tile_coord_mnl)]
 
     # Wait for accumulator buffer full
     acc_full = acc_consumer.wait_and_advance()
 
-    # Epilogue loop over subtiles
+    # Epilogue loop over subtiles with 2-stage pipelining
     epi_m_tiles = cute.size(tTR_tAcc1.shape, mode=[3])
     epi_n_tiles = cute.size(tTR_tAcc1.shape, mode=[4])
     
+    # Track in-flight TMA stores (0 = none, 1 = stage 0, 2 = stage 1)
+    stage_idx = cutlass.Int32(0)
+    
     for epi_m in cutlass.range(epi_m_tiles):
         for epi_n in cutlass.range(epi_n_tiles):
-            # Copy accumulator to register
+            # Copy accumulator to register (T2R)
             cute.copy(tiled_copy_t2r, tTR_tAcc1[(None, None, None, epi_m, epi_n)], tTR_rAcc1)
             cute.copy(tiled_copy_t2r, tTR_tAcc2[(None, None, None, epi_m, epi_n)], tTR_rAcc2)
 
@@ -691,23 +702,38 @@ def kernel(
             acc_vec = acc_vec1 * acc_vec2
             tTR_rC.store(acc_vec.to(c_dtype))
             
-            # Store from registers to SMEM using R2S copy
-            cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, 0)])
+            # Store from registers to SMEM using R2S copy (alternating stages)
+            cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, stage_idx)])
             
-            # Fence and sync before TMA store
+            # Fence to ensure R2S completes before TMA reads SMEM
             cute.arch.fence_proxy(
                 cute.arch.ProxyKind.async_shared,
                 space=cute.arch.SharedSpace.shared_cta,
             )
             cute.arch.barrier()
             
-            # TMA store from SMEM to Global (one warp does this)
+            # TMA store from SMEM to Global (one warp issues TMA)
             if warp_idx == 0:
-                cute.copy(tma_atom_c, bSG_sC, bSG_gC[(None, epi_m, epi_n)])
+                # Select source SMEM buffer based on stage
+                if stage_idx == 0:
+                    cute.copy(tma_atom_c, bSG_sC_0, bSG_gC[(None, epi_m, epi_n)])
+                else:
+                    cute.copy(tma_atom_c, bSG_sC_1, bSG_gC[(None, epi_m, epi_n)])
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                
+                # Wait for at most 1 TMA in flight (pipelining!)
+                # This allows the previous TMA to complete while we process the next tile
+                cute.arch.cp_async_bulk_wait_group(1, read=True)
             
             cute.arch.barrier()
+            
+            # Alternate stage for next iteration
+            stage_idx = 1 - stage_idx
+    
+    # Wait for all remaining TMA stores to complete
+    if warp_idx == 0:
+        cute.arch.cp_async_bulk_wait_group(0, read=True)
+    cute.arch.barrier()
 
     acc_full.release()
     # Deallocate TMEM
