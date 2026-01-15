@@ -13,6 +13,7 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.runtime import make_ptr
+from cutlass.utils import LayoutEnum
 
 # Kernel configuration parameters
 # Tile sizes for M, N, K dimensions
@@ -32,6 +33,7 @@ threads_per_cta = 128
 # Stage numbers of shared memory and tmem
 num_acc_stage = 1
 num_ab_stage = 1
+num_c_stage = 2  # Number of stages for C epilogue buffer
 # Total number of columns in tmem
 num_tmem_alloc_cols = 512
 
@@ -57,11 +59,15 @@ def kernel(
     mSFB_nkl1: cute.Tensor,
     tma_atom_sfb2: cute.CopyAtom,
     mSFB_nkl2: cute.Tensor,
-    mC_mnl: cute.Tensor,
+    tma_atom_c: cute.CopyAtom,  # TMA S2G atom for C
+    mC_mnl: cute.Tensor,  # TMA tensor for C store (for global coords)
     a_smem_layout_staged: cute.ComposedLayout,
     b_smem_layout_staged: cute.ComposedLayout,
     sfa_smem_layout_staged: cute.Layout,
     sfb_smem_layout_staged: cute.Layout,
+    c_smem_layout_staged: cute.ComposedLayout,  # SMEM layout for C epilogue
+    epi_tile: cute.Tile,  # Epilogue tile for partitioning
+    c_layout: cutlass.Constexpr[utils.LayoutEnum],  # Layout enum for C tensor (compile-time)
     num_tma_load_bytes: cutlass.Constexpr[int],
     epilogue_op: cutlass.Constexpr = lambda x: x
     * (1.0 / (1.0 + cute.math.exp(-x, fastmath=True))),
@@ -140,6 +146,13 @@ def kernel(
         layout=sfb_smem_layout_staged,
         byte_alignment=128,
     )
+    # (EPI_M, EPI_N, STAGE) - Epilogue buffer for C
+    sC = smem.allocate_tensor(
+        element_type=c_dtype,
+        layout=c_smem_layout_staged.outer,
+        byte_alignment=128,
+        swizzle=c_smem_layout_staged.inner,
+    )
 
     #
     # Initialize mainloop ab_pipeline, acc_pipeline and their states
@@ -162,6 +175,16 @@ def kernel(
             threads_per_cta,
         ),
     ).make_participants()
+    
+    # C store pipeline for TMA S2G
+    c_producer_group = pipeline.CooperativeGroup(
+        pipeline.Agent.Thread,
+        cute.arch.WARP_SIZE,  # One warp for TMA store
+    )
+    c_pipeline = pipeline.PipelineTmaStore.create(
+        num_stages=num_c_stage,
+        producer_group=c_producer_group,
+    )
 
     #
     # Local_tile partition global tensors
@@ -560,50 +583,131 @@ def kernel(
         acc_empty.commit()
 
     #
-    # Epilogue
-    # Partition for epilogue
+    # Epilogue with TMA store
     #
-    op = tcgen05.Ld32x32bOp(tcgen05.Repetition.x128, tcgen05.Pack.NONE)
-    copy_atom_t2r = cute.make_copy_atom(op, cutlass.Float32)
-    tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tCtAcc1)
+    
+    acc_dtype = cutlass.Float32
+    cta_tile_shape_mnk = (
+        mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape),
+        mma_tiler_mnk[1],
+        mma_tiler_mnk[2],
+    )
+    
+    # Get the TMEM load copy atom using helper
+    copy_atom_t2r = sm100_utils.get_tmem_load_op(
+        cta_tile_shape_mnk,
+        c_layout,
+        c_dtype,
+        acc_dtype,
+        epi_tile,
+        False,  # use_2cta_instrs
+    )
+    
+    # Flat divide accumulators by epilogue tile
+    # Our accumulator has shape (MMA, MMA_M, MMA_N)
+    # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
+    tCtAcc1_epi = cute.flat_divide(
+        tCtAcc1[((None, None), 0, 0)],
+        epi_tile,
+    )
+    tCtAcc2_epi = cute.flat_divide(
+        tCtAcc2[((None, None), 0, 0)],
+        epi_tile,
+    )
+    
+    # Create T2R tiled copy
+    tiled_copy_t2r = tcgen05.make_tmem_copy(
+        copy_atom_t2r, tCtAcc1_epi[(None, None, 0, 0)]
+    )
     thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
-    # (T2R_M, T2R_N, EPI_M, EPI_M)
-    tTR_tAcc1 = thr_copy_t2r.partition_S(tCtAcc1)
-    # (T2R_M, T2R_N, EPI_M, EPI_M)
-    tTR_tAcc2 = thr_copy_t2r.partition_S(tCtAcc2)
-    # (T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
-    tTR_gC = thr_copy_t2r.partition_D(tCgC)
-    # (T2R_M, T2R_N, EPI_M, EPI_N）
+    
+    # Partition accumulators (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
+    tTR_tAcc1 = thr_copy_t2r.partition_S(tCtAcc1_epi)
+    tTR_tAcc2 = thr_copy_t2r.partition_S(tCtAcc2_epi)
+    
+    # Flat divide global C by epilogue tile
+    # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
+    gC_epi = cute.flat_divide(
+        tCgC[((None, None), 0, 0, None, None, None)], epi_tile
+    )
+    # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
+    tTR_gC = thr_copy_t2r.partition_D(gC_epi)
+    
+    # Register tensors for accumulator
     tTR_rAcc1 = cute.make_rmem_tensor(
-        tTR_gC[None, None, None, None, 0, 0, 0].shape, cutlass.Float32
+        tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, acc_dtype
     )
-    # (T2R_M, T2R_N, EPI_M, EPI_N）
     tTR_rAcc2 = cute.make_rmem_tensor(
-        tTR_gC[None, None, None, None, 0, 0, 0].shape, cutlass.Float32
+        tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, acc_dtype
     )
-    # (T2R_M, T2R_N, EPI_M, EPI_N）
     tTR_rC = cute.make_rmem_tensor(
-        tTR_gC[None, None, None, None, 0, 0, 0].shape, c_dtype
+        tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, c_dtype
     )
-    # STG Atom
-    simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype)
-    tTR_gC = tTR_gC[(None, None, None, None, *mma_tile_coord_mnl)]
+    
+    # Setup R2S copy (Register to SMEM)
+    copy_atom_r2s = sm100_utils.get_smem_store_op(
+        c_layout, c_dtype, acc_dtype, tiled_copy_t2r
+    )
+    tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
+    thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+    
+    # Partition SMEM for R2S (R2S, R2S_M, R2S_N, STAGE)
+    tRS_sC = thr_copy_r2s.partition_D(sC)
+    # Retile register tensor for R2S
+    tRS_rC = tiled_copy_r2s.retile(tTR_rC)
+    
+    # Setup TMA partition for SMEM to Global
+    sC_for_tma = cute.group_modes(sC[(None, None, 0)], 0, 2)
+    gC_for_tma = cute.group_modes(gC_epi, 0, 2)
+    bSG_sC, bSG_gC = cpasync.tma_partition(
+        tma_atom_c,
+        0,  # CTA coordinate
+        cute.make_layout(1),  # Single CTA
+        sC_for_tma,
+        gC_for_tma,
+    )
+    
+    # Slice to current tile (no stage dimension in our case)
+    # tTR_tAcc has shape (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
+    # No need to slice stage since we don't have one
+    bSG_gC = bSG_gC[(None, None, None, *mma_tile_coord_mnl)]
 
     # Wait for accumulator buffer full
     acc_full = acc_consumer.wait_and_advance()
 
-    # Copy accumulator to register
-    cute.copy(tiled_copy_t2r, tTR_tAcc1, tTR_rAcc1)
-    cute.copy(tiled_copy_t2r, tTR_tAcc2, tTR_rAcc2)
+    # Epilogue loop over subtiles
+    epi_m_tiles = cute.size(tTR_tAcc1.shape, mode=[3])
+    epi_n_tiles = cute.size(tTR_tAcc1.shape, mode=[4])
+    
+    for epi_m in cutlass.range(epi_m_tiles):
+        for epi_n in cutlass.range(epi_n_tiles):
+            # Copy accumulator to register
+            cute.copy(tiled_copy_t2r, tTR_tAcc1[(None, None, None, epi_m, epi_n)], tTR_rAcc1)
+            cute.copy(tiled_copy_t2r, tTR_tAcc2[(None, None, None, epi_m, epi_n)], tTR_rAcc2)
 
-    # Silu activation on acc1 and multiply with acc2
-    acc_vec1 = epilogue_op(tTR_rAcc1.load())
-    acc_vec2 = tTR_rAcc2.load()
-    acc_vec = acc_vec1 * acc_vec2
-
-    tTR_rC.store(acc_vec.to(c_dtype))
-    # Store C to global memory
-    cute.copy(simt_atom, tTR_rC, tTR_gC)
+            # Silu activation on acc1 and multiply with acc2
+            acc_vec1 = epilogue_op(tTR_rAcc1.load())
+            acc_vec2 = tTR_rAcc2.load()
+            acc_vec = acc_vec1 * acc_vec2
+            tTR_rC.store(acc_vec.to(c_dtype))
+            
+            # Store from registers to SMEM using R2S copy
+            cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, 0)])
+            
+            # Fence and sync before TMA store
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            cute.arch.barrier()
+            
+            # TMA store from SMEM to Global (one warp does this)
+            if warp_idx == 0:
+                cute.copy(tma_atom_c, bSG_sC, bSG_gC[(None, epi_m, epi_n)])
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            
+            cute.arch.barrier()
 
     acc_full.release()
     # Deallocate TMEM
@@ -710,6 +814,27 @@ def my_kernel(
         num_ab_stage,
     )
     atom_thr_size = cute.size(tiled_mma.thr_id.shape)
+    
+    # Compute epilogue tile shape and C SMEM layout
+    c_layout = LayoutEnum.from_tensor(c_tensor)
+    cta_tile_shape_mnk = (
+        mma_tiler_mnk[0] // atom_thr_size,
+        mma_tiler_mnk[1],
+        mma_tiler_mnk[2],
+    )
+    use_2cta_instrs = False
+    epi_tile = sm100_utils.compute_epilogue_tile_shape(
+        cta_tile_shape_mnk,
+        use_2cta_instrs,
+        c_layout,
+        c_dtype,
+    )
+    c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+        c_dtype,
+        c_layout,
+        epi_tile,
+        num_c_stage,
+    )
 
     # Setup TMA for A
     a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, None, 0))
@@ -776,6 +901,16 @@ def my_kernel(
         cluster_layout_vmnk .shape,
         internal_type=cutlass.Int16,
     )
+    
+    # Setup TMA for C store (S2G - Shared to Global)
+    c_smem_layout = cute.slice_(c_smem_layout_staged, (None, None, 0))
+    c_cta_tiler = cute.composition(cute.make_identity_layout(c_tensor.shape), epi_tile)
+    tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileS2GOp(),
+        c_tensor,
+        c_smem_layout,
+        c_cta_tiler,
+    )
 
     # Compute TMA load bytes
     a_copy_size = cute.size_in_bytes(ab_dtype, a_smem_layout)
@@ -822,14 +957,18 @@ def my_kernel(
         tma_atom_sfb2,              # TMA copy atom for loading scale factors for B2
         tma_tensor_sfb2,            # Tensor descriptor for SFB2 (block scale factors for B2)
         
-        # Output tensor C (stores both C1 and C2 results)
-        c_tensor,                   # Output tensor where both GEMM results will be stored (m, n, l)
+        # TMA atom for C store (S2G)
+        tma_atom_c,                 # TMA copy atom for storing C from shared to global memory
+        tma_tensor_c,               # TMA tensor for C store
         
         # Shared memory layouts with staging for pipelined execution
         a_smem_layout_staged,       # Staged shared memory layout for A (includes stage dimension)
         b_smem_layout_staged,       # Staged shared memory layout for B1/B2 (includes stage dimension)
         sfa_smem_layout_staged,     # Staged shared memory layout for SFA (includes stage dimension)
         sfb_smem_layout_staged,     # Staged shared memory layout for SFB1/SFB2 (includes stage dimension)
+        c_smem_layout_staged,       # Staged shared memory layout for C epilogue
+        epi_tile,                   # Epilogue tile for partitioning
+        c_layout,                   # Layout enum for C tensor
         
         # Pipeline synchronization parameter
         num_tma_load_bytes,         # Total bytes to load per TMA transaction (for barrier setup)
