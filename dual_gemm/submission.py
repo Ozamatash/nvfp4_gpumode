@@ -37,10 +37,8 @@ num_c_stage = 2   # Overlap R2S writes with TMA S2G stores
 # Total number of columns in tmem
 num_tmem_alloc_cols = 512
 
-# TMA Prefetch configuration
-# None = use num_ab_stage (default), 0 = disable, >0 = explicit distance
-prefetch_dist = num_ab_stage  # Use num_ab_stage as default prefetch distance
-prefetch_enabled = prefetch_dist > 0
+# TMA Prefetch distance (how many tiles ahead to prefetch)
+prefetch_dist = num_ab_stage
 
 # Warp specialization IDs
 tma_warp_id = 0   # Warp 0: TMA loads
@@ -485,14 +483,13 @@ def kernel(
         cpasync.prefetch_descriptor(tma_atom_c)
         
         # Initial prefetch: prime the pipeline with first prefetch_dist tiles
-        if prefetch_enabled:
-            for pf_k_tile in cutlass.range(0, min(prefetch_dist, k_tile_cnt), unroll=1):
-                cute.prefetch(tma_atom_a, tAgA[(None, pf_k_tile)])
-                cute.prefetch(tma_atom_b1, tBgB1[(None, pf_k_tile)])
-                cute.prefetch(tma_atom_b2, tBgB2[(None, pf_k_tile)])
-                cute.prefetch(tma_atom_sfa, tAgSFA[((0, None), pf_k_tile)])
-                cute.prefetch(tma_atom_sfb1, tBgSFB1[((0, None), pf_k_tile)])
-                cute.prefetch(tma_atom_sfb2, tBgSFB2[((0, None), pf_k_tile)])
+        for pf_k_tile in cutlass.range(0, min(prefetch_dist, k_tile_cnt), unroll=1):
+            cute.prefetch(tma_atom_a, tAgA[(None, pf_k_tile)])
+            cute.prefetch(tma_atom_b1, tBgB1[(None, pf_k_tile)])
+            cute.prefetch(tma_atom_b2, tBgB2[(None, pf_k_tile)])
+            cute.prefetch(tma_atom_sfa, tAgSFA[((0, None), pf_k_tile)])
+            cute.prefetch(tma_atom_sfb1, tBgSFB1[((0, None), pf_k_tile)])
+            cute.prefetch(tma_atom_sfb2, tBgSFB2[((0, None), pf_k_tile)])
         
         for k_tile in range(k_tile_cnt):
             # Acquire empty buffer slot
@@ -537,15 +534,14 @@ def kernel(
             )
             
             # Rolling prefetch: issue prefetch for future tiles
-            if prefetch_enabled:
-                if ab_empty.count < k_tile_cnt - prefetch_dist:
-                    future_k_tile = ab_empty.count + prefetch_dist
-                    cute.prefetch(tma_atom_a, tAgA[(None, future_k_tile)])
-                    cute.prefetch(tma_atom_b1, tBgB1[(None, future_k_tile)])
-                    cute.prefetch(tma_atom_b2, tBgB2[(None, future_k_tile)])
-                    cute.prefetch(tma_atom_sfa, tAgSFA[((0, None), future_k_tile)])
-                    cute.prefetch(tma_atom_sfb1, tBgSFB1[((0, None), future_k_tile)])
-                    cute.prefetch(tma_atom_sfb2, tBgSFB2[((0, None), future_k_tile)])
+            if ab_empty.count < k_tile_cnt - prefetch_dist:
+                future_k_tile = ab_empty.count + prefetch_dist
+                cute.prefetch(tma_atom_a, tAgA[(None, future_k_tile)])
+                cute.prefetch(tma_atom_b1, tBgB1[(None, future_k_tile)])
+                cute.prefetch(tma_atom_b2, tBgB2[(None, future_k_tile)])
+                cute.prefetch(tma_atom_sfa, tAgSFA[((0, None), future_k_tile)])
+                cute.prefetch(tma_atom_sfb1, tBgSFB1[((0, None), future_k_tile)])
+                cute.prefetch(tma_atom_sfb2, tBgSFB2[((0, None), future_k_tile)])
 
     # MMA Warp: handles all computation
     if warp_idx == mma_warp_id:
