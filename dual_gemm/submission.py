@@ -470,20 +470,20 @@ def kernel(
             )
             cute.copy(
                 tma_atom_sfa,
-                tAgSFA[(None, ab_empty.count)],
-                tAsSFA[(None, ab_empty.index)],
+                tAgSFA[((0, None), ab_empty.count)],
+                tAsSFA[((0, None), ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
             )
             cute.copy(
                 tma_atom_sfb1,
-                tBgSFB1[(None, ab_empty.count)],
-                tBsSFB1[(None, ab_empty.index)],
+                tBgSFB1[((0, None), ab_empty.count)],
+                tBsSFB1[((0, None), ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
             )
             cute.copy(
                 tma_atom_sfb2,
-                tBgSFB2[(None, ab_empty.count)],
-                tBsSFB2[(None, ab_empty.index)],
+                tBgSFB2[((0, None), ab_empty.count)],
+                tBsSFB2[((0, None), ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
             )
 
