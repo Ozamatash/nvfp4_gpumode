@@ -18,7 +18,13 @@ from cutlass.utils import LayoutEnum
 
 # Kernel configuration parameters
 # Tile sizes for M, N, K dimensions
-mma_tiler_mnk= (128, 128, 256)  
+use_2cta = True
+mma_tiler_mnk= (256, 128, 256) if use_2cta else (128, 128, 256)
+mma_tiler_sfb = (
+    mma_tiler_mnk[0] // (2 if use_2cta else 1),
+    mma_tiler_mnk[1],
+    mma_tiler_mnk[2],
+)
 # Shape of the K dimension for the MMA instruction
 mma_inst_shape_k = 64
 # FP4 data type for A and B
@@ -39,7 +45,7 @@ num_c_stage = 2   # Overlap R2S writes with TMA S2G stores
 num_tmem_alloc_cols = 512
 
 # Cluster shape for TMA multicast (M, N)
-cluster_shape_mn = (1, 4)
+cluster_shape_mn = (2, 1) if use_2cta else (1, 4)
 
 # TMA Prefetch distance (how many tiles ahead to prefetch)
 # Match num_ab_stage for optimal pipeline utilization
@@ -59,6 +65,7 @@ def ceil_div(a, b):
 @cute.kernel
 def kernel(
     tiled_mma: cute.TiledMma,
+    tiled_mma_sfb: cute.TiledMma,
     tma_atom_a: cute.CopyAtom,
     mA_mkl: cute.Tensor,
     tma_atom_b1: cute.CopyAtom,
@@ -74,6 +81,7 @@ def kernel(
     tma_atom_c: cute.CopyAtom,  # TMA S2G atom for C
     mC_mnl: cute.Tensor,  # TMA tensor for C store (for global coords)
     cluster_layout_vmnk: cute.Layout,
+    cluster_layout_sfb_vmnk: cute.Layout,
     a_smem_layout_staged: cute.ComposedLayout,
     b_smem_layout_staged: cute.ComposedLayout,
     sfa_smem_layout_staged: cute.Layout,
@@ -91,13 +99,20 @@ def kernel(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     tidx = cute.arch.thread_idx()
+    use_2cta_instrs = use_2cta
 
     #
     # Setup cta/thread coordinates
     #
     # Coords inside cluster
     bidx, bidy, bidz = cute.arch.block_idx()
-    mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
+    mma_coord_vmnk = (
+        bidx % cute.size(cluster_layout_vmnk, mode=[0]),
+        bidx // cute.size(cluster_layout_vmnk, mode=[0]),
+        bidy,
+        bidz,
+    )
+    mma_tile_coord_v = mma_coord_vmnk[0]
     is_leader_cta = mma_tile_coord_v == 0
     cta_rank_in_cluster = cute.arch.make_warp_uniform(
         cute.arch.block_idx_in_cluster()
@@ -105,13 +120,16 @@ def kernel(
     block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
         cta_rank_in_cluster
     )
+    block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(
+        cta_rank_in_cluster
+    )
 
     # Coords outside cluster
     cta_coord = (bidx, bidy, bidz)
     mma_tile_coord_mnl = (
-        cta_coord[0] // cute.size(tiled_mma.thr_id.shape),
-        cta_coord[1],
-        cta_coord[2],
+        mma_coord_vmnk[1],
+        mma_coord_vmnk[2],
+        mma_coord_vmnk[3],
     )
     # Coord inside cta
     tidx, _, _ = cute.arch.thread_idx()
@@ -123,6 +141,7 @@ def kernel(
     class SharedStorage:
         ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, num_ab_stage * 2]
         acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, num_acc_stage * 2]
+        tmem_dealloc_mbar_ptr: cutlass.Int64
         tmem_holding_buf: cutlass.Int32
 
     smem = utils.SmemAllocator()
@@ -201,7 +220,7 @@ def kernel(
         producer_group=ab_pipeline_producer_group,
         consumer_group=pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            threads_per_cta,
+            threads_per_cta * cluster_shape_mn[0],
         ),
         cta_layout_vmnk=cluster_layout_vmnk,
         defer_sync=True,
@@ -209,7 +228,9 @@ def kernel(
     acc_producer, acc_consumer = acc_pipeline.make_participants()
 
     # Cluster arrive after barrier init
-    if cutlass.const_expr(cluster_shape_mn[1] > 1):
+    if cutlass.const_expr(
+        (cluster_shape_mn[0] > 1) or (cluster_shape_mn[1] > 1)
+    ):
         pipeline_init_arrive(cluster_shape_mn=cluster_shape_mn, is_relaxed=True)
         pipeline_init_wait(cluster_shape_mn=cluster_shape_mn)
     
@@ -242,11 +263,11 @@ def kernel(
         mSFA_mkl, cute.slice_(mma_tiler_mnk, (None, 0, None)), (None, None, None)
     )
     gSFB_nkl1 = cute.local_tile(
-        mSFB_nkl1, cute.slice_(mma_tiler_mnk, (0, None, None)), (None, None, None)
+        mSFB_nkl1, cute.slice_(mma_tiler_sfb, (0, None, None)), (None, None, None)
     )
     # (bN, bK, RestN, RestK, RestL)
     gSFB_nkl2 = cute.local_tile(
-        mSFB_nkl2, cute.slice_(mma_tiler_mnk, (0, None, None)), (None, None, None)
+        mSFB_nkl2, cute.slice_(mma_tiler_sfb, (0, None, None)), (None, None, None)
     )
     # (bM, bN, RestM, RestN, RestL)
     gC_mnl = cute.local_tile(
@@ -267,10 +288,13 @@ def kernel(
     tCgB2 = thr_mma.partition_B(gB_nkl2)
     # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
     tCgSFA = thr_mma.partition_A(gSFA_mkl)
+    thr_mma_sfb = tiled_mma_sfb.get_slice(
+        bidx % cute.size(tiled_mma_sfb.thr_id.shape)
+    )
     # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
-    tCgSFB1 = thr_mma.partition_B(gSFB_nkl1)
+    tCgSFB1 = thr_mma_sfb.partition_B(gSFB_nkl1)
     # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
-    tCgSFB2 = thr_mma.partition_B(gSFB_nkl2)
+    tCgSFB2 = thr_mma_sfb.partition_B(gSFB_nkl2)
     # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
     tCgC = thr_mma.partition_C(gC_mnl)
 
@@ -326,8 +350,8 @@ def kernel(
     # ((atom_v, rest_v), RestN, RestK, RestL)
     tBsSFB1, tBgSFB1 = cpasync.tma_partition(
         tma_atom_sfb1,
-        block_in_cluster_coord_vmnk[1],
-        b_cta_layout,
+        block_in_cluster_coord_sfb_vmnk[1],
+        cute.make_layout(cute.size(cluster_layout_sfb_vmnk, mode=[1])),
         cute.group_modes(sSFB1, 0, 3),
         cute.group_modes(tCgSFB1, 0, 3),
     )
@@ -338,8 +362,8 @@ def kernel(
     # ((atom_v, rest_v), RestN, RestK, RestL)
     tBsSFB2, tBgSFB2 = cpasync.tma_partition(
         tma_atom_sfb2,
-        block_in_cluster_coord_vmnk[1],
-        b_cta_layout,
+        block_in_cluster_coord_sfb_vmnk[1],
+        cute.make_layout(cute.size(cluster_layout_sfb_vmnk, mode=[1])),
         cute.group_modes(sSFB2, 0, 3),
         cute.group_modes(tCgSFB2, 0, 3),
     )
@@ -351,12 +375,17 @@ def kernel(
     #
     a_full_mcast_mask = None
     sfa_full_mcast_mask = None
+    sfb_full_mcast_mask = None
     if cutlass.const_expr(cluster_shape_mn[1] > 1):
         a_full_mcast_mask = cpasync.create_tma_multicast_mask(
             cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
         )
         sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(
             cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+        )
+    if cutlass.const_expr(cluster_shape_mn[0] > 1):
+        sfb_full_mcast_mask = cpasync.create_tma_multicast_mask(
+            cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk, mcast_mode=1
         )
 
     #
@@ -386,6 +415,8 @@ def kernel(
     tmem = utils.TmemAllocator(
         storage.tmem_holding_buf,
         barrier_for_retrieve=tmem_alloc_barrier,
+        is_two_cta=use_2cta,
+        two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
     )
     tmem.allocate(num_tmem_alloc_cols)
     tmem.wait_for_alloc()
@@ -418,8 +449,8 @@ def kernel(
 
     # SFB1, SFB2 tmem layout: (MMA, MMA_N, MMA_K)
     tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
-        tiled_mma,
-        mma_tiler_mnk,
+        tiled_mma_sfb,
+        mma_tiler_sfb,
         sf_vec_size,
         cute.slice_(sfb_smem_layout_staged, (None, None, None, 0)),
     )
@@ -448,7 +479,9 @@ def kernel(
     #
     # Make S2T CopyAtom
     copy_atom_s2t = cute.make_copy_atom(
-        tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE),
+        tcgen05.Cp4x32x128bOp(
+            tcgen05.CtaGroup.TWO if use_2cta else tcgen05.CtaGroup.ONE
+        ),
         sf_dtype,
     )
     # (MMA, MMA_MN, MMA_K, STAGE)
@@ -527,7 +560,7 @@ def kernel(
         cpasync.prefetch_descriptor(tma_atom_sfb2)
         
         # Initial prefetch: prime the pipeline with first prefetch_dist tiles
-        for pf_k_tile in cutlass.range(0, min(prefetch_dist, k_tile_cnt), unroll=4):
+        for pf_k_tile in cutlass.range(0, min(prefetch_dist, k_tile_cnt)):
             cute.prefetch(tma_atom_a, tAgA[(None, pf_k_tile)])
             cute.prefetch(tma_atom_b1, tBgB1[(None, pf_k_tile)])
             cute.prefetch(tma_atom_b2, tBgB2[(None, pf_k_tile)])
@@ -539,7 +572,7 @@ def kernel(
         ab_producer.reset()
         peek_ab_empty_status = ab_producer.try_acquire()
         
-        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=4):
+        for k_tile in cutlass.range(0, k_tile_cnt, 1,):
             # Conditionally acquire empty buffer slot (non-blocking if peek succeeded)
             ab_empty = ab_producer.acquire_and_advance(peek_ab_empty_status)
 
@@ -575,12 +608,14 @@ def kernel(
                 tBgSFB1[((0, None), ab_empty.count)],
                 tBsSFB1[((0, None), ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
+                mcast_mask=sfb_full_mcast_mask,
             )
             cute.copy(
                 tma_atom_sfb2,
                 tBgSFB2[((0, None), ab_empty.count)],
                 tBsSFB2[((0, None), ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
+                mcast_mask=sfb_full_mcast_mask,
             )
             
             # Rolling prefetch: issue prefetch for future tiles
@@ -601,7 +636,8 @@ def kernel(
         # Wait for all TMA loads to complete (producer tail)
         ab_producer.tail()
 
-    # MMA Warp: handles all computation
+    # MMA Warp: handles all computation (only leader CTA does actual compute)
+    # Per the 2CTA diagram: CTA0 does MMA, CTA1 skips to mainloop barrier
     if warp_idx == mma_warp_id and is_leader_cta:
         # Acquire accumulator buffer
         acc_empty = acc_producer.acquire_and_advance()
@@ -612,7 +648,7 @@ def kernel(
         ab_consumer.reset()
         peek_ab_full_status = ab_consumer.try_wait()
         
-        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=4):
+        for k_tile in cutlass.range(0, k_tile_cnt, 1,):
             # Conditionally wait for TMA data (non-blocking if peek succeeded)
             ab_full = ab_consumer.wait_and_advance(peek_ab_full_status)
 
@@ -691,6 +727,8 @@ def kernel(
         
         # Commit accumulator to epilogue
         acc_empty.commit()
+        # Cleanup: wait for accumulator buffer to be properly synchronized
+        acc_producer.tail()
 
     #
     # Epilogue with TMA store
@@ -710,7 +748,7 @@ def kernel(
         c_dtype,
         acc_dtype,
         epi_tile,
-        False,  # use_2cta_instrs
+        use_2cta_instrs,
     )
     
     # Flat divide accumulators by epilogue tile
@@ -909,17 +947,32 @@ def my_kernel(
     sfb_tensor1 = cute.make_tensor(sfb1_ptr, sfb_layout)
     sfb_tensor2 = cute.make_tensor(sfb2_ptr, sfb_layout)
 
-    mma_op = tcgen05.MmaMXF4NVF4Op(
+    tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        ab_dtype,
+        tcgen05.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
         sf_dtype,
-        (mma_tiler_mnk[0], mma_tiler_mnk[1], mma_inst_shape_k),
-        tcgen05.CtaGroup.ONE,
-        tcgen05.OperandSource.SMEM,
+        sf_vec_size,
+        tcgen05.CtaGroup.TWO if use_2cta else tcgen05.CtaGroup.ONE,
+        mma_tiler_mnk[:2],
     )
-    tiled_mma = cute.make_tiled_mma(mma_op)
+    tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        ab_dtype,
+        tcgen05.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
+        sf_dtype,
+        sf_vec_size,
+        tcgen05.CtaGroup.ONE,
+        mma_tiler_sfb[:2],
+    )
 
     cluster_layout_vmnk = cute.tiled_divide(
         cute.make_layout((*cluster_shape_mn, 1)),
         (tiled_mma.thr_id.shape,),
+    )
+    cluster_layout_sfb_vmnk = cute.tiled_divide(
+        cute.make_layout((*cluster_shape_mn, 1)),
+        (tiled_mma_sfb.thr_id.shape,),
     )
 
     # Compute A/B/SFA/SFB/C shared memory layout
@@ -944,8 +997,8 @@ def my_kernel(
     )
     # SFB1 and SFB2 have the same size thus share the same smem layout
     sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
-        tiled_mma,
-        mma_tiler_mnk,
+        tiled_mma_sfb,
+        mma_tiler_sfb,
         sf_vec_size,
         num_ab_stage,
     )
@@ -958,7 +1011,7 @@ def my_kernel(
         mma_tiler_mnk[1],
         mma_tiler_mnk[2],
     )
-    use_2cta_instrs = False
+    use_2cta_instrs = use_2cta
     epi_tile = sm100_utils.compute_epilogue_tile_shape(
         cta_tile_shape_mnk,
         use_2cta_instrs,
@@ -1020,7 +1073,7 @@ def my_kernel(
         sfa_smem_layout,
         mma_tiler_mnk,
         tiled_mma,
-        cluster_layout_vmnk .shape,
+        cluster_layout_vmnk.shape,
         internal_type=cutlass.Int16,
     )
     # Setup TMA for SFB1
@@ -1028,15 +1081,15 @@ def my_kernel(
         sfb_smem_layout_staged , (None, None, None, 0)
     )
     sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
-        cluster_shape_mn, tiled_mma.thr_id
+        cluster_shape_mn, tiled_mma_sfb.thr_id
     )
     tma_atom_sfb1, tma_tensor_sfb1 = cute.nvgpu.make_tiled_tma_atom_B(
         sfb_op,
         sfb_tensor1,
         sfb_smem_layout,
-        mma_tiler_mnk,
-        tiled_mma,
-        cluster_layout_vmnk .shape,
+        mma_tiler_sfb,
+        tiled_mma_sfb,
+        cluster_layout_sfb_vmnk.shape,
         internal_type=cutlass.Int16,
     )
     # Setup TMA for SFB2
@@ -1044,9 +1097,9 @@ def my_kernel(
         sfb_op,
         sfb_tensor2,
         sfb_smem_layout,
-        mma_tiler_mnk,
-        tiled_mma,
-        cluster_layout_vmnk .shape,
+        mma_tiler_sfb,
+        tiled_mma_sfb,
+        cluster_layout_sfb_vmnk.shape,
         internal_type=cutlass.Int16,
     )
     
@@ -1067,7 +1120,7 @@ def my_kernel(
     sfb_copy_size = cute.size_in_bytes(sf_dtype, sfb_smem_layout)
     num_tma_load_bytes = (
         a_copy_size + b_copy_size * 2 + sfa_copy_size + sfb_copy_size * 2
-    ) * atom_thr_size
+    ) * atom_thr_size * cute.size(cluster_layout_vmnk, mode=[0])
 
     # Compute grid size
     grid = (
@@ -1081,6 +1134,7 @@ def my_kernel(
     kernel(
         # MMA (Matrix Multiply-Accumulate) configuration
         tiled_mma,                  # Tiled MMA object defining NVFP4 GEMM compute pattern
+        tiled_mma_sfb,              # Tiled MMA for SFB path (cluster-safe layout)
         
         # TMA (Tensor Memory Accelerator) atoms and tensors for shared input matrix A
         tma_atom_a,                 # TMA copy atom defining how to load A from global memory
@@ -1110,6 +1164,7 @@ def my_kernel(
         tma_atom_c,                 # TMA copy atom for storing C from shared to global memory
         tma_tensor_c,               # TMA tensor for C store
         cluster_layout_vmnk,        # Cluster layout for multicast
+        cluster_layout_sfb_vmnk,    # Cluster layout for SFB multicast
         
         # Shared memory layouts with staging for pipelined execution
         a_smem_layout_staged,       # Staged shared memory layout for A (includes stage dimension)

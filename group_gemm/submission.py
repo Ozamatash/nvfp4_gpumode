@@ -41,8 +41,8 @@ num_tmem_alloc_cols = 512
 
 # Optimized kernel configuration (fixed for the benchmark shapes)
 cluster_shape_mn = (1, 1)
-epilog_warp_id = (0,)
-mma_warp_id = 0
+epilog_warp_id = (1,)
+mma_warp_id = 1
 tma_warp_id = 0
 
 # Helper function for ceiling division
@@ -310,9 +310,9 @@ def kernel(
     )
 
     # Initialize mainloop ab_pipeline, acc_pipeline and their states
-    ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+    ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 32)
     ab_pipeline_consumer_group = pipeline.CooperativeGroup(
-        pipeline.Agent.Thread, 1
+        pipeline.Agent.Thread, 32
     )
     ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
         barrier_storage=storage.ab_mbar_ptr.data_ptr(),
@@ -324,10 +324,10 @@ def kernel(
     acc_producer, acc_consumer = pipeline.PipelineUmmaAsync.create(
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
         num_stages=num_acc_stage,
-        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
         consumer_group=pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            threads_per_cta,
+            32 * len(epilog_warp_id),
         ),
     ).make_participants()
 
@@ -637,110 +637,97 @@ def kernel(
     #
     # Main loop
     #
-    if valid_tile and warp_idx == 0:
-        # Wait for accumulator buffer empty
-        acc_empty = acc_producer.acquire_and_advance()
-        # Set ACCUMULATE field to False for the first k_tile iteration
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        # Execute k_tile loop
-        for k_tile in range(k_tile_cnt):
-            # Wait for AB buffer empty
-            ab_empty = ab_producer.acquire_and_advance()
-
-            #  TMA load A/B/SFA/SFB to shared memory
-            cute.copy(
-                tma_atom_a,
-                tAgA[(None, k_tile)],
-                tAsA[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                    tensormap_a_gmem_ptr,
-                    cute.AddressSpace.generic,
-                ),
-            )
-            cute.copy(
-                tma_atom_b,
-                tBgB[(None, k_tile)],
-                tBsB[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                    tensormap_b_gmem_ptr,
-                    cute.AddressSpace.generic,
-                ),
-            )
-            cute.copy(
-                tma_atom_sfa,
-                tAgSFA[(None, k_tile)],
-                tAsSFA[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                    tensormap_sfa_gmem_ptr,
-                    cute.AddressSpace.generic,
-                ),
-            )
-            cute.copy(
-                tma_atom_sfb,
-                tBgSFB[(None, k_tile)],
-                tBsSFB[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                    tensormap_sfb_gmem_ptr,
-                    cute.AddressSpace.generic,
-                ),
-            )
-
-            # Wait for AB buffer full
-            ab_full = ab_consumer.wait_and_advance()
-
-            #  Copy SFA/SFB from shared memory to TMEM
-            s2t_stage_coord = (None, None, None, None, ab_full.index)
-            tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
-            tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
-            cute.copy(
-                tiled_copy_s2t_sfa,
-                tCsSFA_compact_s2t_staged,
-                tCtSFA_compact_s2t,
-            )
-            cute.copy(
-                tiled_copy_s2t_sfb,
-                tCsSFB_compact_s2t_staged,
-                tCtSFB_compact_s2t,
-            )
-
-            # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
-            num_kblocks = cute.size(tCrA, mode=[2])
-            for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                kblock_coord = (
-                    None,
-                    None,
-                    kblock_idx,
-                    ab_full.index,
+    if valid_tile and warp_idx == epilog_warp_id[0]:
+        if warp_idx == tma_warp_id:
+            for k_tile in range(k_tile_cnt):
+                ab_empty = ab_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, k_tile)],
+                    tAsA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                    tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
+                        tensormap_a_gmem_ptr,
+                        cute.AddressSpace.generic,
+                    ),
+                )
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, k_tile)],
+                    tBsB[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                    tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
+                        tensormap_b_gmem_ptr,
+                        cute.AddressSpace.generic,
+                    ),
+                )
+                cute.copy(
+                    tma_atom_sfa,
+                    tAgSFA[(None, k_tile)],
+                    tAsSFA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                    tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
+                        tensormap_sfa_gmem_ptr,
+                        cute.AddressSpace.generic,
+                    ),
+                )
+                cute.copy(
+                    tma_atom_sfb,
+                    tBgSFB[(None, k_tile)],
+                    tBsSFB[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                    tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
+                        tensormap_sfb_gmem_ptr,
+                        cute.AddressSpace.generic,
+                    ),
+                )
+        if warp_idx == mma_warp_id:
+            acc_empty = acc_producer.acquire_and_advance()
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            for k_tile in range(k_tile_cnt):
+                ab_full = ab_consumer.wait_and_advance()
+                s2t_stage_coord = (None, None, None, None, ab_full.index)
+                tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
+                tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
+                cute.copy(
+                    tiled_copy_s2t_sfa,
+                    tCsSFA_compact_s2t_staged,
+                    tCtSFA_compact_s2t,
+                )
+                cute.copy(
+                    tiled_copy_s2t_sfb,
+                    tCsSFB_compact_s2t_staged,
+                    tCtSFB_compact_s2t,
                 )
 
-                # Set SFA/SFB tensor to tiled_mma
-                sf_kblock_coord = (None, None, kblock_idx)
-                tiled_mma.set(
-                    tcgen05.Field.SFA,
-                    tCtSFA[sf_kblock_coord].iterator,
-                )
-                tiled_mma.set(
-                    tcgen05.Field.SFB,
-                    tCtSFB[sf_kblock_coord].iterator,
-                )
+                num_kblocks = cute.size(tCrA, mode=[2])
+                for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
+                    kblock_coord = (
+                        None,
+                        None,
+                        kblock_idx,
+                        ab_full.index,
+                    )
+                    sf_kblock_coord = (None, None, kblock_idx)
+                    tiled_mma.set(
+                        tcgen05.Field.SFA,
+                        tCtSFA[sf_kblock_coord].iterator,
+                    )
+                    tiled_mma.set(
+                        tcgen05.Field.SFB,
+                        tCtSFB[sf_kblock_coord].iterator,
+                    )
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[kblock_coord],
+                        tCrB[kblock_coord],
+                        tCtAcc,
+                    )
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                cute.gemm(
-                    tiled_mma,
-                    tCtAcc,
-                    tCrA[kblock_coord],
-                    tCrB[kblock_coord],
-                    tCtAcc,
-                )
-                # Enable accumulate on tCtAcc after first kblock
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-
-            # Async arrive AB buffer empty
-            ab_full.release()
-        acc_empty.commit()
+                ab_full.release()
+            acc_empty.commit()
 
     #
     # Epilogue
