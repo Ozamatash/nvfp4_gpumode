@@ -193,6 +193,3 @@ cpasync.fence_tma_desc_acquire(shared_desc_ptr)
 - Want SMEM -> GMEM + reduce: `CopyReduceBulkTensorTileS2GOp`
 
 ---
-
-If you want, I can also add a tiny runnable CuteDSL kernel in this repo
-that mirrors the load/store examples from the original article.
