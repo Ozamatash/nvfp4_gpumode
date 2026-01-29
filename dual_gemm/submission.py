@@ -220,7 +220,7 @@ def kernel(
         producer_group=ab_pipeline_producer_group,
         consumer_group=pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            threads_per_cta * cluster_shape_mn[0],
+            threads_per_cta,
         ),
         cta_layout_vmnk=cluster_layout_vmnk,
         defer_sync=True,
@@ -415,10 +415,12 @@ def kernel(
     tmem = utils.TmemAllocator(
         storage.tmem_holding_buf,
         barrier_for_retrieve=tmem_alloc_barrier,
+        allocator_warp_id=tma_warp_id,
         is_two_cta=use_2cta,
         two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
     )
-    tmem.allocate(num_tmem_alloc_cols)
+    if warp_idx == tma_warp_id:
+        tmem.allocate(num_tmem_alloc_cols)
     tmem.wait_for_alloc()
     acc_tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
     tCtAcc1 = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)

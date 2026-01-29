@@ -67,39 +67,20 @@ CONFIG_MAP = {
 }
 
 
-def get_default_config() -> dict:
-    """Fallback config for non-benchmark shapes."""
-    return {
-        "tile_mn": (128, 128),
-        "cluster_mn": (1, 1),
-        "occupancy": 1,
-        "cache_policy": TMA_CACHE_EVICT_NORMAL,
-        "num_ab_stage": None,
-    }
+def get_config(num_groups: int, n: int, k: int) -> dict:
+    """Get kernel config for problem size. Raises if not found."""
+    key = (num_groups, n, k)
+    if key not in CONFIG_MAP:
+        raise KeyError(f"No config found for (g={num_groups}, N={n}, K={k}). Add it to CONFIG_MAP.")
+    return CONFIG_MAP[key]
 
 
-def select_config(problem_sizes: List[Tuple[int, int, int, int]]) -> tuple[dict, bool]:
-    """
-    Select tuned config for known benchmark shapes, else fallback.
-    Returns (config, is_tuned).
-    """
-    num_groups = len(problem_sizes)
-    _, n0, k0, _ = problem_sizes[0]
-    same_nk = all(n == n0 and k == k0 for _, n, k, _ in problem_sizes)
-    m_values = tuple(m for m, _, _, _ in problem_sizes)
-    key = (num_groups, n0, k0)
-
-    if same_nk and key in CONFIG_MAP and CONFIG_MAP[key]["m_values"] == m_values:
-        return CONFIG_MAP[key], True
-    return get_default_config(), False
-
-
-def compute_grid_info(
-    problem_sizes: List[Tuple[int, int, int, int]],
-    tile_mn: Tuple[int, int],
-    cluster_mn: Tuple[int, int],
-) -> dict:
-    """Pre-compute grid information from actual problem sizes."""
+def compute_grid_info(config: dict, n: int) -> dict:
+    """Pre-compute grid information from known shapes."""
+    m_values = config["m_values"]
+    tile_mn = config["tile_mn"]
+    cluster_mn = config["cluster_mn"]
+    
     cluster_tile_m = tile_mn[0] * cluster_mn[0]
     cluster_tile_n = tile_mn[1] * cluster_mn[1]
     
@@ -108,7 +89,7 @@ def compute_grid_info(
     group_cta_offsets = [0]
     total_ctas = 0
     
-    for m, n, _, _ in problem_sizes:
+    for m in m_values:
         m_tiles = (m + cluster_tile_m - 1) // cluster_tile_m
         n_tiles = (n + cluster_tile_n - 1) // cluster_tile_n
         group_ctas = m_tiles * n_tiles
@@ -1196,8 +1177,11 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
     
     num_groups = len(problem_sizes)
     
-    # Select tuned config for benchmarks, fallback otherwise
-    config, _ = select_config(problem_sizes)
+    # Get N, K from first group (constant across groups for benchmarks)
+    _, n, k, _ = problem_sizes[0]
+    
+    # Look up config for this problem
+    config = get_config(num_groups, n, k)
     
     # Cache key includes config AND problem_sizes (since problem_sizes is Constexpr)
     problem_sizes_tuple = tuple(tuple(ps) for ps in problem_sizes)
@@ -1255,9 +1239,10 @@ def custom_kernel(data: input_t) -> output_t:
     """
     abc_tensors, _, sfasfb_reordered_tensors, problem_sizes = data
 
-    # Select tuned config for benchmarks, fallback otherwise
+    # Get config for this problem
     num_groups = len(problem_sizes)
-    config, _ = select_config(problem_sizes)
+    _, n, k, _ = problem_sizes[0]
+    config = get_config(num_groups, n, k)
 
     # Compile kernel for this batch
     compiled_func = compile_kernel(problem_sizes)
@@ -1278,12 +1263,8 @@ def custom_kernel(data: input_t) -> output_t:
     tensor_of_abc_ptrs = torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda")
     tensor_of_sfasfb_ptrs = torch.tensor(sfasfb_ptrs, dtype=torch.int64, device="cuda")
 
-    # Compute grid info from actual shapes
-    grid_info = compute_grid_info(
-        problem_sizes,
-        config["tile_mn"],
-        config["cluster_mn"],
-    )
+    # Use pre-computed grid info from known shapes
+    grid_info = compute_grid_info(config, n)
     total_num_clusters = grid_info["total_ctas"]
 
     # Allocate tensormap buffer
